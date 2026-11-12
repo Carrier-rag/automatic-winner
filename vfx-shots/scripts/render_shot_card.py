@@ -109,6 +109,10 @@ def validate(shot):
         start, end = rng
         if end <= start:
             errors.append(f"第 {i} 个节拍 {seg.get('t')} 结束时间不大于开始时间")
+        elif end - start < 0.3:
+            warns.append(
+                f"第 {i} 个节拍仅 {end - start:.2f}s，短于 0.3s 模型难以呈现，建议合并或延长"
+            )
         if abs(start - prev_end) > 0.011:
             warns.append(f"第 {i} 个节拍从 {start}s 开始，与上一节拍结束于 {prev_end}s 不连续")
         prev_end = end
@@ -200,13 +204,14 @@ def render_one(shot, index=None):
     return "\n".join(lines)
 
 
-def render(payload, check_only=False):
+def render(payload, check_only=False, as_json=False):
     shots = payload["shots"] if isinstance(payload, dict) and "shots" in payload else [payload]
     if not isinstance(shots, list) or not shots:
         print("错误: 输入必须是镜头对象或 {\"shots\": [...]}", file=sys.stderr)
         return 2
 
     all_ok = True
+    report = []
     for i, shot in enumerate(shots, 1):
         title, errors, warns = validate(shot)
         tag = f"[{i}] {title}"
@@ -219,6 +224,11 @@ def render(payload, check_only=False):
             print(f"✓ {tag}", file=sys.stderr)
         for w in warns:
             print(f"    提醒: {w}", file=sys.stderr)
+        report.append({"index": i, "title": title, "errors": errors, "warnings": warns})
+
+    if as_json:
+        print(json.dumps({"ok": all_ok, "shots": report}, ensure_ascii=False, indent=2))
+        return 0 if all_ok else 1
 
     if not all_ok:
         print("\n校验未通过，未输出分镜卡。", file=sys.stderr)
@@ -254,6 +264,8 @@ def main():
     ap.add_argument("source", help="JSON 文件路径，或 - 表示从标准输入读取")
     ap.add_argument("--out", help="输出 Markdown 路径，默认打印到标准输出")
     ap.add_argument("--check-only", action="store_true", help="只校验，不输出分镜卡")
+    ap.add_argument("--json", dest="as_json", action="store_true",
+                    help="以 JSON 输出校验报告（ok / shots[].errors / shots[].warnings）")
     args = ap.parse_args()
 
     try:
@@ -269,7 +281,7 @@ def main():
         print(f"错误: JSON 解析失败 — {e}", file=sys.stderr)
         return 2
 
-    result = render(payload, check_only=args.check_only)
+    result = render(payload, check_only=args.check_only, as_json=args.as_json)
     if isinstance(result, int):
         return result
 
