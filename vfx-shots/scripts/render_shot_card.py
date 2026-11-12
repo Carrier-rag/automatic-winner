@@ -10,6 +10,7 @@
 输入 JSON 结构:
 {
   "title": "掌心雷",
+  "mode": "green_screen",          // green_screen 或 in_scene（默认）
   "category": "能量系",
   "duration": 5.0,
   "aspect": "16:9",
@@ -55,6 +56,15 @@ FEEDBACK_HINTS = [
 ]
 MOVE_WORDS = ["推", "拉", "摇", "横移", "环绕", "手持", "跟拍"]
 
+# 绿幕模式专用
+GREEN_BG_TERMS = [
+    "绿幕", "纯绿背景", "纯绿色背景", "绿色背景", "纯绿", "均匀纯绿",
+    "chroma key", "green screen", "无绿边", "绿溢", "绿边溢出",
+]
+GREEN_TINT_WORDS = ["绿", "青绿", "翠", "荧光绿", "柠檬绿"]
+GREEN_SCENE_WORDS = ["地面", "墙面", "墙壁", "地平线", "房间", "窗外", "天空", "桌椅"]
+GREEN_FORBID_HINTS = ["渐变", "暗角", "场景", "阴影", "投影", "地面"]
+
 REQUIRED = ["title", "category", "duration", "first_frame"]
 REQUIRED_VIDEO = ["camera", "timeline", "move", "light"]
 
@@ -71,6 +81,10 @@ def parse_range(text):
 def validate(shot):
     errors, warns = [], []
     title = shot.get("title", "<未命名>")
+    mode = shot.get("mode") or "in_scene"
+    if mode not in ("green_screen", "in_scene"):
+        warns.append(f"mode 取值应为 green_screen 或 in_scene，当前 {mode!r}，按 in_scene 处理")
+        mode = "in_scene"
 
     for key in REQUIRED:
         if not shot.get(key):
@@ -136,14 +150,18 @@ def validate(shot):
         warns.append(f"运镜同时出现多种主动运动 {active}，模型难以执行，建议只保留一种")
 
     light = video.get("light", "") or ""
-    if "同步" not in light:
+    if mode == "green_screen":
+        if not any(h in light for h in ("一致", "不变", "不产生", "不照射")):
+            warns.append("【光照】绿幕素材应写明「背景亮度全程一致、不产生投影」")
+    elif "同步" not in light:
         warns.append("【光照】未声明同步关系，特效亮度变化时环境光斑容易闪烁")
 
     forbid = video.get("forbid") or []
     if len(forbid) < 3:
         warns.append(f"禁止项只有 {len(forbid)} 条，建议 3–5 条具体约束")
-    if len(forbid) > 5:
-        warns.append(f"禁止项 {len(forbid)} 条，过多会削弱正向描述")
+    upper = 6 if mode == "green_screen" else 5
+    if len(forbid) > upper:
+        warns.append(f"禁止项 {len(forbid)} 条，超过建议上限 {upper} 条，过多会削弱正向描述")
 
     blob = " ".join([
         first_frame,
@@ -153,12 +171,73 @@ def validate(shot):
     if hits:
         warns.append(f"出现抽象形容词 {hits}，请改写为可见的物理描述")
 
-    if first_frame and not any(h in first_frame for h in SCALE_HINTS):
-        warns.append("首帧缺少尺度参照物（人/手/栏杆/地砖等），模型无法判断特效大小")
-    if first_frame and not any(h in first_frame for h in FEEDBACK_HINTS):
-        warns.append("首帧缺少环境反馈（照亮/投影/扰动），特效容易变成贴纸")
+    if mode == "green_screen":
+        _validate_green_screen(shot, first_frame, forbid, errors, warns)
+    else:
+        if first_frame and not any(h in first_frame for h in SCALE_HINTS):
+            warns.append("首帧缺少尺度参照物（人/手/栏杆/地砖等），模型无法判断特效大小")
+        if first_frame and not any(h in first_frame for h in FEEDBACK_HINTS):
+            warns.append("首帧缺少环境反馈（照亮/投影/扰动），特效容易变成贴纸")
 
     return title, errors, warns
+
+
+def _green_tint_hits(text):
+    """找出正向描述里的绿色用词，忽略「绿幕 / 均匀纯绿 / 不含绿色成分」这类表述。"""
+    scrub = text
+    for term in GREEN_BG_TERMS:
+        scrub = scrub.replace(term, "　")
+    hits = []
+    for m in re.finditer("绿", scrub):
+        ctx = scrub[max(0, m.start() - 3):m.start()]
+        if re.search("[不无没未]", ctx):
+            continue
+        hits.append(scrub[max(0, m.start() - 2):m.start() + 2])
+    return hits
+
+
+def _validate_green_screen(shot, first_frame, forbid, errors, warns):
+    """绿幕模式的专属校验。必失败项（缺背景声明/用绿/混场景）升级为错误，其余为提醒。"""
+    if not first_frame:
+        return
+
+    # 1. 必须声明纯绿背景
+    if not any(t in first_frame for t in GREEN_BG_TERMS):
+        errors.append("绿幕模式未声明纯绿背景（缺「均匀纯绿背景 / chroma key green」）")
+
+    # 2. 必须用画面占比锁定尺度
+    if not re.search(r"占画面|画面高度|画面宽度|\d+\s*%", first_frame):
+        warns.append("绿幕模式没有参照物可用，须用画面占比锁定尺度（如「占画面高度 70%」）")
+
+    # 3. 主色不能含绿——绿幕下必然被抠掉
+    tint = _green_tint_hits(first_frame)
+    if tint:
+        errors.append(f"特效用色含绿（{tint}），绿幕下会被 keyer 吃掉，改用橙白/蓝白/紫/品红")
+
+    # 4. 不能有环境照明与投影：按分句判断，避免误伤「不产生投影」这类否定句
+    env_words = ["照亮", "投出", "投影", "光斑", "阴影", "地面", "墙面"]
+    env = sorted({
+        w
+        for clause in re.split(r"[，。；、]", first_frame)
+        for w in env_words
+        if w in clause and not re.search("[不无没未]", clause)
+    })
+    if env:
+        warns.append(f"出现环境反馈 {env}，绿幕下背景不能被照亮或投影，请删掉")
+
+    # 5. 不能混入场景元素
+    scene = sorted({
+        w
+        for clause in re.split(r"[，。；、]", first_frame)
+        for w in GREEN_SCENE_WORDS
+        if w in clause and not re.search("[不无没未]", clause)
+    })
+    if scene:
+        errors.append(f"出现场景元素 {scene}，绿幕素材不应包含任何场景")
+
+    # 6. 禁止项要覆盖背景均匀性
+    if forbid and not any(h in " ".join(forbid) for h in GREEN_FORBID_HINTS):
+        warns.append("绿幕禁止项未覆盖背景均匀性，建议加入「背景出现渐变或暗角」")
 
 
 def render_one(shot, index=None):
@@ -168,7 +247,14 @@ def render_one(shot, index=None):
     heading = "## " + (f"{index}. " if index else "") + shot.get("title", "未命名")
     lines = [heading, ""]
 
-    meta = [f"**类型** {shot.get('category', '')}", f"**时长** {duration}s", f"**画幅** {aspect}"]
+    mode = shot.get("mode") or "in_scene"
+    mode_label = "绿幕素材" if mode == "green_screen" else "实景成片"
+    meta = [
+        f"**类型** {shot.get('category', '')}",
+        f"**模式** {mode_label}",
+        f"**时长** {duration}s",
+        f"**画幅** {aspect}",
+    ]
     if shot.get("logline"):
         meta.insert(0, f"**一句话** {shot['logline']}")
     lines.append(" ｜ ".join(meta))
